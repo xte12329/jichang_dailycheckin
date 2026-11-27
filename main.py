@@ -27,11 +27,18 @@ import base64
 import io
 import json
 import os
+import random
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 # === 强制 UTF-8 输出 ===
 if sys.stdout.encoding != 'utf-8':
@@ -102,90 +109,271 @@ def click_first(page, selectors, timeout=2500):
     return False
 
 
-def vlm_solve(page, domain):
-    """用智谱免费视觉模型识别点选题并点击，返回是否通过"""
-    if not ZHIPU_API_KEY:
-        print('[验证码] 未配置 ZHIPU_API_KEY，无法自动识别点选题')
-        return False
+def vlm_chat(prompt, images):
+    """调用智谱 OpenAI 兼容接口，images 为图片字节列表，返回文本"""
+    content = [{'type': 'text', 'text': prompt}]
+    for img in images:
+        if not img:
+            continue
+        b64 = base64.b64encode(img).decode('utf-8')
+        content.append({'type': 'image_url',
+                        'image_url': {'url': f'data:image/png;base64,{b64}'}})
+    resp = requests.post(
+        'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+        headers={'Authorization': f'Bearer {ZHIPU_API_KEY}',
+                 'Content-Type': 'application/json'},
+        json={'model': 'glm-4v-flash',
+              'messages': [{'role': 'user', 'content': content}]},
+        timeout=60,
+    )
+    result = resp.json()
+    if 'error' in result:
+        raise RuntimeError(result['error'])
+    return (result['choices'][0]['message']['content'] or '').strip()
 
-    # 直接用 HTTP 调智谱 OpenAI 兼容接口，避免 zhipuai SDK 的依赖问题
-    # 优先截验证码弹窗，找不到就截整页
-    img_bytes = None
-    for sel in ['.geetest_panel', '.geetest_popup', '.geetest_modal',
-                '[class*="geetest_panel"]', 'body']:
+
+def parse_json_array(text):
+    """从模型输出里提取 JSON 整数数组"""
+    if not text:
+        return []
+    cleaned = re.sub(r'```[a-zA-Z]*', '', text).replace('```', '').strip()
+    m = re.search(r'\[.*?\]', cleaned, re.DOTALL)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def clean_name(text):
+    """把模型输出的物体名称清洗成短词"""
+    if not text:
+        return ''
+    name = text.strip().splitlines()[0].strip()
+    name = re.sub(r'^(图中是|图片中是|这是|答案是|物体名称是|名称是|一个|一只|一张)', '', name)
+    name = re.sub(r'[^\w\u4e00-\u9fff]', '', name)
+    return name[:12]
+
+
+def wait_grid_loaded(page):
+    """等待九宫格图片加载并稳定，避免截到空白/过渡态"""
+    deadline = time.time() + 8
+    last = None
+    stable = 0
+    while time.time() < deadline:
         try:
-            loc = page.locator(sel).first
-            if loc.count() and loc.is_visible():
-                img_bytes = loc.screenshot()
-                break
+            state = page.evaluate("""() => {
+                const box = document.querySelector('.geetest_table_box');
+                if (!box) return null;
+                const imgs = Array.from(box.querySelectorAll('img'));
+                const bgs = Array.from(box.querySelectorAll('*'))
+                    .map(el => getComputedStyle(el).backgroundImage)
+                    .filter(v => v && v !== 'none');
+                const opacity = parseFloat(getComputedStyle(box).opacity || '1');
+                return {total: imgs.length,
+                        complete: imgs.filter(i => i.complete && i.naturalWidth > 0).length,
+                        bgCount: bgs.length, opacity: opacity};
+            }""")
+        except Exception:
+            state = None
+        if state:
+            has_content = ((state['total'] > 0 and state['complete'] >= state['total'])
+                           or state['bgCount'] > 0)
+            if has_content and state['opacity'] >= 0.95:
+                sig = (state['total'], state['complete'], state['bgCount'])
+                stable = stable + 1 if sig == last else 1
+                last = sig
+                if stable >= 2:
+                    page.wait_for_timeout(300)
+                    return True
+        page.wait_for_timeout(400)
+    return False
+
+
+def crop_cells(grid_bytes):
+    """把九宫格整图切成 9 格（1-9）"""
+    if Image is None:
+        return []
+    img = Image.open(io.BytesIO(grid_bytes))
+    w, h = img.size
+    cw, ch = w / 3.0, h / 3.0
+    ix, iy = cw * 0.06, ch * 0.06
+    cells = []
+    for r in range(3):
+        for c in range(3):
+            cell = img.crop((int(c * cw + ix), int(r * ch + iy),
+                             int((c + 1) * cw - ix), int((r + 1) * ch - iy)))
+            buf = io.BytesIO()
+            cell.save(buf, format='PNG')
+            cells.append(buf.getvalue())
+    return cells
+
+
+def normalize_cells(items):
+    """清洗格子编号：合法(1-9)、去重、有序；全选视为失控"""
+    out = []
+    for x in items:
+        try:
+            v = int(str(x).strip())
         except Exception:
             continue
-    if img_bytes is None:
-        img_bytes = page.screenshot()
+        if 1 <= v <= 9 and v not in out:
+            out.append(v)
+    if len(out) >= 9:
+        return []
+    return sorted(out)
 
-    # 留下截图供排查（Actions 会作为 artifact 上传）
-    with open(f'captcha_{domain.replace(".", "_")}.png', 'wb') as f:
-        f.write(img_bytes)
 
-    b64 = base64.b64encode(img_bytes).decode('utf-8')
-    prompt = (
-        '这是 GeeTest 验证码截图，可能是九宫格（从 3x3 图片中选出符合文字提示的物体）、'
-        '图标点选或文字点选。\n'
-        '请直接执行验证：输出需要点击的位置序号列表。\n'
-        '九宫格编号规则：第一行 1、2、3，第二行 4、5、6，第三行 7、8、9。\n'
-        '只返回 JSON 整数数组，例如 [3, 7]；无法判断返回 []；不要任何解释文字。'
-    )
-    try:
-        resp = requests.post(
-            'https://open.bigmodel.cn/api/paas/v4/chat/completions',
-            headers={'Authorization': f'Bearer {ZHIPU_API_KEY}',
-                     'Content-Type': 'application/json'},
-            json={
-                'model': 'glm-4v-flash',
-                'messages': [{'role': 'user', 'content': [
-                    {'type': 'text', 'text': prompt},
-                    {'type': 'image_url',
-                     'image_url': {'url': f'data:image/png;base64,{b64}'}},
-                ]}],
-            },
-            timeout=60,
-        )
-        result = resp.json()
-        if 'error' in result:
-            raise RuntimeError(result['error'])
-        raw = (result['choices'][0]['message']['content'] or '').strip()
-    except Exception as e:
-        print(f'[验证码] 视觉模型调用失败: {e}')
+def describe_cells(cells):
+    """并发识别 9 个格子的物体名称"""
+    results = [None] * len(cells)
+
+    def worker(i):
+        raw = vlm_chat('这是九宫格验证码中的一个格子。只回答格子里物体的中文名称（2-6个字）。'
+                       '空白或看不出物体只回答：空白。不要解释。', [cells[i]])
+        return i, clean_name(raw) or '未知'
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for i, name in pool.map(worker, range(len(cells))):
+            results[i] = name
+    return results
+
+
+def vlm_solve(page, domain):
+    """用智谱视觉模型识别九宫格并点击，返回是否通过"""
+    if not ZHIPU_API_KEY:
+        print('[验证码] 未配置 ZHIPU_API_KEY')
         return False
 
-    print(f'[验证码] 模型原始输出: {raw!r}')
-    m = re.search(r'\[.*?\]', raw, re.DOTALL)
-    if not m:
-        return False
+    container = page.locator('.geetest_table_box').first
     try:
-        cells = [int(x) for x in json.loads(m.group(0)) if isinstance(x, int)]
+        if not container.is_visible(timeout=3000) or container.count() == 0:
+            print('[验证码] 未找到九宫格容器 .geetest_table_box')
+            return False
     except Exception:
+        print('[验证码] 九宫格容器不可见')
         return False
-    cells = [c for c in cells if 1 <= c <= 9]
+
+    # 关键：等图片加载完成再截图
+    wait_grid_loaded(page)
+
+    # 步骤1：识别题目（图片提示或文字提示）
+    target = ''
+    tip = page.locator('.geetest_tip_img').first
+    try:
+        if tip.count() and tip.is_visible(timeout=1500):
+            tip_bytes = tip.screenshot()
+            with open(f'captcha_{domain.replace(".", "_")}_tip.png', 'wb') as f:
+                f.write(tip_bytes)
+            target = clean_name(vlm_chat(
+                '这是验证码的题目提示图，图中只有一个物体。只回答该物体的中文名称，不要解释。',
+                [tip_bytes]))
+            print(f'[验证码] 图片题目: {target!r}')
+    except Exception as e:
+        print(f'[验证码] 图片题目识别失败: {e}')
+
+    if not target:
+        try:
+            tip_text = page.locator('.geetest_tip_content').first
+            if tip_text.count() and tip_text.is_visible(timeout=1500):
+                target = clean_name(tip_text.inner_text())
+                print(f'[验证码] 文字题目: {target!r}')
+        except Exception:
+            pass
+
+    if not target:
+        print('[验证码] 未识别到题目，本轮放弃')
+        return False
+
+    # 步骤2：截九宫格整图
+    try:
+        grid_bytes = container.screenshot()
+        with open(f'captcha_{domain.replace(".", "_")}.png', 'wb') as f:
+            f.write(grid_bytes)
+    except Exception as e:
+        print(f'[验证码] 九宫格截图失败: {e}')
+        return False
+
+    # 步骤3：整图直选
+    cells = []
+    try:
+        raw = vlm_chat(
+            f'这是一张 3x3 九宫格验证码。格子编号：第一行 1、2、3，第二行 4、5、6，'
+            f'第三行 7、8、9。请找出所有内容是【{target}】的格子（同类的不同角度、'
+            f'材质、玩具模型也算命中）。只返回 JSON 整数数组如 [1,5]，没有则 []，不要解释。',
+            [grid_bytes])
+        print(f'[验证码] 整图直选: {raw!r}')
+        cells = normalize_cells(parse_json_array(raw))
+    except Exception as e:
+        print(f'[验证码] 整图直选失败: {e}')
+
+    # 步骤4：逐格识别兜底
     if not cells:
+        print('[验证码] 整图直选无结果，改逐格识别')
+        crop = crop_cells(grid_bytes)
+        if crop:
+            names = describe_cells(crop)
+            print(f'[验证码] 逐格识别: {names}')
+            hits = [i + 1 for i, n in enumerate(names)
+                    if n not in ('空白', '未知', '') and (target in n or n in target)]
+            if hits:
+                cells = normalize_cells(hits)
+                print(f'[验证码] 名称匹配: {cells}')
+            else:
+                try:
+                    raw = vlm_chat(
+                        f'题目是找出所有【{target}】。9 个格子的识别结果：\n'
+                        + '\n'.join(f'{i+1}. {n}' for i, n in enumerate(names))
+                        + '\n判断哪些格子属于该类（含同义词、上下位词，空白/未知不算）。'
+                        '只返回 JSON 整数数组，不要解释。', [])
+                    cells = normalize_cells(parse_json_array(raw))
+                    print(f'[验证码] 语义裁决: {cells}')
+                except Exception as e:
+                    print(f'[验证码] 语义裁决失败: {e}')
+
+    if not cells:
+        print('[验证码] 本轮无有效格子，稍后刷新')
         return False
 
-    print(f'[验证码] 准备点击格子: {cells}')
-    for idx in cells:
-        click_first(page, [
-            f'.geetest_faces > div:nth-child({idx})',
-            f'.geetest_face:nth-child({idx})',
-            f'[class*="geetest_face"]:nth-child({idx})',
-            f'.geetest_panel img:nth-child({idx})',
-        ])
+    # 步骤5：按坐标点击（樱花项目验证过的方式，绕开 CSS 选择器）
+    try:
+        box = container.bounding_box()
+        cw, ch = box['width'] / 3, box['height'] / 3
+        print(f'[验证码] 容器 {box["width"]:.0f}x{box["height"]:.0f}, 格子 {cw:.0f}x{ch:.0f}')
+        clicked = 0
+        for val in cells:
+            r, c = (val - 1) // 3, (val - 1) % 3
+            x = box['x'] + c * cw + cw / 2 + random.uniform(-cw * 0.1, cw * 0.1)
+            y = box['y'] + r * ch + ch / 2 + random.uniform(-ch * 0.1, ch * 0.1)
+            page.mouse.click(x, y)
+            clicked += 1
+            time.sleep(random.uniform(0.3, 0.6))
+        print(f'[验证码] 已点击 {clicked} 个格子: {cells}')
+        if clicked == 0:
+            return False
+    except Exception as e:
+        print(f'[验证码] 坐标点击失败: {e}')
+        return False
 
-    # 确定按钮
-    click_first(page, [
-        '.geetest_commit', '[class*="geetest_commit"]',
-        '.geetest_btn-submit', '[class*="submit"]',
-    ])
-    page.wait_for_timeout(2500)
-    return captcha_ready(page)
+    # 步骤6：提交
+    page.wait_for_timeout(300)
+    click_first(page, ['.geetest_commit', '.geetest_submit', 'text=确认'])
+    page.wait_for_timeout(2000)
+
+    # 判断是否通过
+    if captcha_ready(page):
+        print('[验证码] 通过')
+        return True
+    body = ''
+    try:
+        body = page.locator('body').inner_text(timeout=1500)
+    except Exception:
+        pass
+    if any(h in body for h in ['验证失败', '再试一次', '请再试一次']):
+        print('[验证码] 校验失败，需刷新')
+    return False
 
 
 def try_domain(domain):
@@ -215,28 +403,33 @@ def try_domain(domain):
             '[class*="geetest_btn"]', '[class*="geetest"] button',
         ])
 
+        # 无感验证：最多等 3 秒
         ok = False
-        for attempt in range(1, MAX_CAPTCHA_RETRY + 1):
-            print(f'[验证码] 等待验证 {attempt}/{MAX_CAPTCHA_RETRY} ...')
-            for _ in range(12):
-                if captcha_ready(page):
+        for _ in range(6):
+            if captcha_ready(page):
+                ok = True
+                break
+            page.wait_for_timeout(500)
+
+        # 点选题：用视觉模型多轮尝试
+        if not ok:
+            for attempt in range(1, MAX_CAPTCHA_RETRY + 1):
+                print(f'[验证码] 视觉识别 {attempt}/{MAX_CAPTCHA_RETRY} ...')
+                if vlm_solve(page, domain):
                     ok = True
                     break
-                page.wait_for_timeout(1000)
-            if ok:
-                print('[验证码] 已通过')
-                break
-            print('[验证码] 未通过，尝试视觉模型识别')
-            if not vlm_solve(page, domain):
-                # 重新点一次验证按钮再试
-                click_first(page, [
-                    '.geetest_refresh', '[class*="geetest_refresh"]',
-                    '.geetest_btn_click', '.geetest_tip',
-                ])
+                # 刷新验证码再试（樱花项目验证过的刷新按钮）
+                click_first(page, ['.geetest_refresh', '[class*="geetest_refresh"]'])
+                page.wait_for_timeout(1200)
+
         if not ok:
-            page.screenshot(path=f'captcha_fail_{domain.replace(".", "_")}.png')
+            try:
+                page.screenshot(path=f'captcha_fail_{domain.replace(".", "_")}.png')
+            except Exception:
+                pass
             browser.close()
             return False, '验证码未通过（截图已保存）'
+        print('[验证码] 已通过')
 
         # 提交登录
         click_first(page, ['button[type="submit"]', '.login', 'button.login'])
