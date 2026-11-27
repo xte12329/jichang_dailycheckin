@@ -71,6 +71,7 @@ Actions 页 → **Run workflow** 手动跑一次。
   GitHub runner 镜像升级到 Ubuntu 26.04 后，`setup-python` 找不到写死的精确小版本。
   已改为 `python-version: '3.10'`（自动选该系列最新可用版），**切勿写死成 `3.10.16`**。
 - checkout / setup-python / upload-artifact 已升级到 v7，避免 Node 20 弃用告警。
+- **`ModuleNotFoundError: No module named 'sniffio'`**：`zhipuai` SDK 在 Actions 的 Python 3.10 环境里缺依赖。已移除 zhipuai SDK，改用 `requests` 直连智谱 OpenAI 兼容接口 `https://open.bigmodel.cn/api/paas/v4/chat/completions`，requirements 只保留 requests + playwright，**不要再装 zhipuai**。
 - 协议求解方案失败的根因已记录在上文，不要退回 GeekedTest 方案。
 
 ## 风险与维护
