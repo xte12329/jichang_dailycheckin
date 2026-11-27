@@ -108,9 +108,7 @@ def vlm_solve(page, domain):
         print('[验证码] 未配置 ZHIPU_API_KEY，无法自动识别点选题')
         return False
 
-    from zhipuai import ZhipuAI
-    client = ZhipuAI(api_key=ZHIPU_API_KEY)
-
+    # 直接用 HTTP 调智谱 OpenAI 兼容接口，避免 zhipuai SDK 的依赖问题
     # 优先截验证码弹窗，找不到就截整页
     img_bytes = None
     for sel in ['.geetest_panel', '.geetest_popup', '.geetest_modal',
@@ -138,14 +136,24 @@ def vlm_solve(page, domain):
         '只返回 JSON 整数数组，例如 [3, 7]；无法判断返回 []；不要任何解释文字。'
     )
     try:
-        resp = client.chat.completions.create(
-            model='glm-4v-flash',
-            messages=[{'role': 'user', 'content': [
-                {'type': 'text', 'text': prompt},
-                {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{b64}'}},
-            ]}],
+        resp = requests.post(
+            'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+            headers={'Authorization': f'Bearer {ZHIPU_API_KEY}',
+                     'Content-Type': 'application/json'},
+            json={
+                'model': 'glm-4v-flash',
+                'messages': [{'role': 'user', 'content': [
+                    {'type': 'text', 'text': prompt},
+                    {'type': 'image_url',
+                     'image_url': {'url': f'data:image/png;base64,{b64}'}},
+                ]}],
+            },
+            timeout=60,
         )
-        raw = (resp.choices[0].message.content or '').strip()
+        result = resp.json()
+        if 'error' in result:
+            raise RuntimeError(result['error'])
+        raw = (result['choices'][0]['message']['content'] or '').strip()
     except Exception as e:
         print(f'[验证码] 视觉模型调用失败: {e}')
         return False
@@ -283,7 +291,10 @@ def main():
 
     for domain in DOMAINS:
         for attempt in range(1, 3):
-            ok, msg = try_domain(domain)
+            try:
+                ok, msg = try_domain(domain)
+            except Exception as e:
+                ok, msg = False, f'异常: {type(e).__name__}: {e}'
             if ok:
                 print(f'✅ 签到成功 [{domain}]: {msg}')
                 push('✅ ikuuu 签到成功', f'域名: {domain}\n{msg}\n邮箱: {EMAIL}')
