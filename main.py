@@ -1,153 +1,176 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-ikuuu 机场每日签到 - Cookie 版
-使用浏览器 Cookie 登录，绕过 Geetest V4 验证码
-Cookie 从环境变量 IKUUU_COOKIE 读取，格式：key1=val1; key2=val2
+iKUUU 机场每日签到 - 账号密码自动登录版
+
+每次运行都用账号密码 + GeekedTest 自动过 GeeTest V4 验证码重新登录，
+不再依赖会过期的 Cookie，从根本上解决「cookie 每 5 天掉一次」的问题。
+同时支持多域名自动轮换，应对 ikuuu 频繁更换域名的情况。
+
+环境变量：
+  IKUUU_EMAIL      必填，账号邮箱
+  IKUUU_PASSWD     必填，账号密码
+  IKUUU_DOMAINS    可选，域名列表(逗号分隔)，默认 ikuuu.top,ikuuu.pw,ikuuu.org
+  IKUUU_CAPTCHA_ID 可选，GeeTest V4 captcha_id，默认用 ikuuu 公开值
+  SCKEY            可选，Server酱密钥
+  PUSHPLUS_TOKEN   可选，PushPlus 密钥
 """
-import requests
+import io
 import json
 import os
-import re
 import sys
 import time
 
+import requests
+
 # === 强制 UTF-8 输出 ===
 if sys.stdout.encoding != 'utf-8':
-    import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# === 读取 Cookie ===
-COOKIE_STR = os.environ.get('IKUUU_COOKIE', '')
-if not COOKIE_STR:
-    print('[FATAL] 未设置 IKUUU_COOKIE 环境变量')
-    sys.exit(1)
+from geeked import Geeked
 
-def parse_cookie_string(cookie_str):
-    """解析 Cookie 字符串为字典"""
-    cookies = {}
-    for item in cookie_str.split('; '):
-        if '=' in item:
-            k, v = item.split('=', 1)
-            cookies[k.strip()] = v.strip()
-    return cookies
+# === 配置读取 ===
+EMAIL = os.environ.get('IKUUU_EMAIL', '').strip()
+PASSWD = os.environ.get('IKUUU_PASSWD', '').strip()
 
-def parse_cookie_string_to_header(cookie_str):
-    """解析 Cookie 字符串为 Cookie header 格式"""
-    return cookie_str.replace('; ', '; ')
+# ikuuu 会轮换域名，逐个尝试直到某个可用
+DOMAINS_RAW = os.environ.get('IKUUU_DOMAINS', '')
+DOMAINS = [d.strip() for d in DOMAINS_RAW.split(',') if d.strip()] if DOMAINS_RAW else [
+    'ikuuu.top', 'ikuuu.pw', 'ikuuu.org',
+]
 
-# === 通知配置 ===
+# GeeTest V4 captcha_id（ikuuuu 站点公开值；若失效可从登录页 Network 里抓新的）
+CAPTCHA_ID = os.environ.get('IKUUU_CAPTCHA_ID', '').strip() or 'cc96d05ba8b60f9112f76e18526fcb73'
+
+# 推送配置
 SCKEY = os.environ.get('SCKEY', '')
 PUSHPLUS_TOKEN = os.environ.get('PUSHPLUS_TOKEN', '')
 
-def push(content):
-    """推送通知"""
+MAX_CAPTCHA_RETRY = 3
+MAX_DOMAIN_RETRY = 2
+
+UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
+
+
+def push(title, content):
+    """推送通知（Server酱 / PushPlus 二选一）"""
     if SCKEY and SCKEY != '1':
         try:
-            url = f"https://sctapi.ftqq.com/{SCKEY}.send?title=ikuuu签到&desp={content}"
-            requests.post(url, timeout=10)
+            url = f'https://sctapi.ftqq.com/{SCKEY}.send'
+            requests.post(url, data={'title': title, 'desp': content}, timeout=10)
             print('Server酱推送完成')
         except Exception as e:
             print(f'推送失败: {e}')
     elif PUSHPLUS_TOKEN and PUSHPLUS_TOKEN != '1':
         try:
-            headers = {'Content-Type': 'application/json'}
-            data = {"token": PUSHPLUS_TOKEN, 'title': 'ikuuu签到', 'content': content, "template": "json"}
-            resp = requests.post('http://www.pushplus.plus/send', json=data, headers=headers, timeout=10)
-            print(f'PushPlus 推送: {resp.json().get("code", "?")}')
+            data = {'token': PUSHPLUS_TOKEN, 'title': title,
+                    'content': content, 'template': 'json'}
+            requests.post('http://www.pushplus.plus/send', json=data, timeout=10)
+            print('PushPlus 推送完成')
         except Exception as e:
             print(f'推送失败: {e}')
     else:
         print('未配置消息推送')
 
-# === 主逻辑 ===
-def main():
-    print('=== ikuuu 机场每日签到 (Cookie 版) ===')
-    print(f'Cookie 来源: {"环境变量" if COOKIE_STR else "无"}')
-    
-    # 解析 Cookie
-    cookies = parse_cookie_string(COOKIE_STR)
-    print(f'Cookie 字段: {list(cookies.keys())}')
-    
-    if 'uid' not in cookies or 'key' not in cookies:
-        print('[WARN] Cookie 缺少关键字段 (uid/key)，可能已过期')
-    
-    # 创建 session
-    session = requests.session()
-    
-    # 设置 Cookie
-    for k, v in cookies.items():
-        session.cookies.set(k, v, domain='.ikuuu.top')
-    
-    headers = {
-        'origin': 'https://ikuuu.top',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'referer': 'https://ikuuu.top/user',
+
+def solve_captcha():
+    """用 GeekedTest 求解 GeeTest V4（ai 无感模式），带重试"""
+    for attempt in range(1, MAX_CAPTCHA_RETRY + 1):
+        try:
+            print(f'[验证码] 求解尝试 {attempt}/{MAX_CAPTCHA_RETRY} ...')
+            geeked = Geeked(CAPTCHA_ID, 'ai')
+            result = geeked.solve()
+            print('[验证码] 求解成功')
+            return result
+        except Exception as ex:
+            print(f'[验证码] 求解失败 ({attempt}): {ex}')
+            if attempt < MAX_CAPTCHA_RETRY:
+                time.sleep(2)
+    return None
+
+
+def try_domain(domain):
+    """在单个域名上尝试登录 + 签到，返回 (是否成功, 消息)"""
+    url = f'https://{domain}'
+    login_url = f'{url}/auth/login'
+    check_url = f'{url}/user/checkin'
+    header = {
+        'origin': url,
+        'referer': f'{url}/auth/login',
+        'user-agent': UA,
         'accept': 'application/json, text/javascript, */*; q=0.01',
         'x-requested-with': 'XMLHttpRequest',
     }
-    
-    # === 验证登录状态 ===
-    print('\n[1/2] 验证登录状态...')
+
+    session = requests.Session()
+
+    # 1. 过验证码
+    captcha = solve_captcha()
+    if not captcha:
+        return False, '验证码求解失败'
+
+    # 2. 登录
+    data = {
+        'email': EMAIL,
+        'passwd': PASSWD,
+        'captcha_result[lot_number]': captcha['lot_number'],
+        'captcha_result[captcha_output]': captcha['captcha_output'],
+        'captcha_result[pass_token]': captcha['pass_token'],
+        'captcha_result[gen_time]': captcha['gen_time'],
+    }
     try:
-        resp = session.get('https://ikuuu.top/user/profile', headers=headers, timeout=15, allow_redirects=False)
-        if resp.status_code == 302 or 'login' in resp.text.lower()[:500]:
-            print('[ERROR] Cookie 已过期或无效，需要重新登录获取 Cookie')
-            push('❌ ikuuu 签到失败：Cookie 已过期，请在 Edge 中重新登录 ikuuu.top 并更新 IKUUU_COOKIE Secret')
-            return False
-        
-        if resp.status_code == 200:
-            # 尝试提取用户信息
-            email = cookies.get('email', 'unknown')
-            uid = cookies.get('uid', 'unknown')
-            print(f'✅ 登录成功 (uid={uid}, email={email})')
-        else:
-            print(f'[WARN] 状态码: {resp.status_code}')
-    except Exception as e:
-        print(f'[ERROR] 验证登录失败: {e}')
-        push(f'❌ ikuuu 签到失败: {e}')
-        return False
-    
-    # === 执行签到 ===
-    print('\n[2/2] 执行签到...')
+        resp = session.post(login_url, headers=header, data=data, timeout=20)
+        result = resp.json()
+    except Exception as ex:
+        return False, f'登录请求异常: {ex}'
+
+    if result.get('ret') != 1:
+        return False, f'登录失败: {result.get("msg", result)}'
+
+    # 3. 签到
     try:
-        resp = session.post('https://ikuuu.top/user/checkin', headers=headers, timeout=15)
-        
-        if resp.status_code != 200:
-            print(f'[ERROR] 签到请求失败: HTTP {resp.status_code}')
-            push(f'❌ ikuuu 签到请求失败: HTTP {resp.status_code}')
-            return False
-        
-        # 解析响应
-        try:
-            result = resp.json()
-            msg = result.get('msg', str(result))
-            ret = result.get('ret', None)
-            
-            if ret == 1:
-                print(f'✅ 签到成功！{msg}')
-                content = f'✅ ikuuu 签到成功\n{msg}\nuid: {cookies.get("uid", "?")}'
-            elif ret == 0:
-                # ret=0 可能是已签到或其他状态
-                print(f'⚠️ 签到返回: {msg} (ret={ret})')
-                content = f'⚠️ ikuuu 签到: {msg}'
-            else:
-                print(f'⚠️ 签到返回: {msg}')
-                content = f'ikuuu 签到: {msg}'
-            
-            push(content)
-            return True
-            
-        except json.JSONDecodeError:
-            text = resp.text[:200]
-            print(f'[WARN] 响应不是 JSON: {text}')
-            push(f'ikuuu 签到响应异常: {text}')
-            return False
-            
-    except Exception as e:
-        print(f'[ERROR] 签到失败: {e}')
-        push(f'❌ ikuuu 签到失败: {e}')
+        resp2 = session.post(check_url, headers=header, timeout=20)
+        result2 = resp2.json()
+    except Exception as ex:
+        return False, f'签到请求异常: {ex}'
+
+    msg = result2.get('msg', str(result2))
+    ret = result2.get('ret', None)
+    if ret == 1 or ret == 0 or '成功' in msg or '重复' in msg:
+        return True, msg
+    return False, f'签到返回异常: {msg} (ret={ret})'
+
+
+def main():
+    print('=== iKUUU 机场每日签到（账号密码自动登录版）===')
+    if not EMAIL or not PASSWD:
+        print('[FATAL] 未设置 IKUUU_EMAIL / IKUUU_PASSWD')
+        push('❌ ikuuu 签到失败', '未配置账号密码，请检查 Secrets')
         return False
+
+    print(f'账号: {EMAIL}')
+    print(f'候选域名: {", ".join(DOMAINS)}')
+
+    for domain in DOMAINS:
+        print(f'\n--- 尝试域名 {domain} ---')
+        for attempt in range(1, MAX_DOMAIN_RETRY + 1):
+            ok, msg = try_domain(domain)
+            if ok:
+                print(f'✅ 签到成功 [{domain}]: {msg}')
+                push('✅ ikuuu 签到成功', f'域名: {domain}\n{msg}\n邮箱: {EMAIL}')
+                return True
+            print(f'[{domain}] 第 {attempt} 次失败: {msg}')
+            if attempt < MAX_DOMAIN_RETRY:
+                time.sleep(3)
+
+    print('[ERROR] 所有域名均签到失败')
+    push('❌ ikuuu 签到失败',
+         f'所有域名尝试完毕仍失败。\n账号: {EMAIL}\n'
+         f'请检查密码是否正确、captcha_id 是否过期，或到 Actions 看详细日志。')
+    return False
+
 
 if __name__ == '__main__':
     success = main()
