@@ -1,4 +1,4 @@
-name: "iKUUU Checkin (Auto Login)"
+name: "iKUUU Checkin (Browser Auto Login)"
 
 on:
   schedule:
@@ -7,22 +7,17 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ikuuu-checkin-autologin
+  group: ikuuu-checkin-browser
   cancel-in-progress: true
-
-env:
-  RUN_ENV: 'prod'
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -38,29 +33,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      # 拉取 GeekedTest 求解器，并去掉用不到的 slide/icon/gobang 依赖（省去 opencv/ddddocr 大依赖）
-      - name: Fetch geeked solver
-        run: |
-          git clone --depth 1 https://github.com/xKiian/GeekedTest.git temp_geeked
-          python -c "
-          with open('temp_geeked/geeked/sign.py', 'r', encoding='utf-8') as f:
-              code = f.read()
-          code = code.replace('from geeked.slide import SlideSolver', 'SlideSolver = None')
-          code = code.replace('from geeked.gobang import GobangSolver', 'GobangSolver = None')
-          code = code.replace('from geeked.icon import IconSolver', 'IconSolver = None')
-          with open('temp_geeked/geeked/sign.py', 'w', encoding='utf-8') as f:
-              f.write(code)
-          "
-          mv temp_geeked/geeked ./geeked
-          rm -rf temp_geeked
+          python -m playwright install --with-deps chromium
 
       - name: Run checkin
         env:
           IKUUU_EMAIL: ${{ secrets.IKUUU_EMAIL }}
           IKUUU_PASSWD: ${{ secrets.IKUUU_PASSWD }}
           IKUUU_DOMAINS: ${{ vars.IKUUU_DOMAINS }}
-          IKUUU_CAPTCHA_ID: ${{ vars.IKUUU_CAPTCHA_ID }}
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
           SCKEY: ${{ secrets.SCKEY }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: python3 main.py
+
+      - name: Upload captcha screenshots for debugging
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: captcha-debug
+          path: captcha_*.png
+          if-no-files-found: ignore
+          retention-days: 7
