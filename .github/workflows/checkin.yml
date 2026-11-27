@@ -1,0 +1,65 @@
+name: "iKUUU Checkin (Auto Login)"
+
+on:
+  schedule:
+    # 北京时间 09:33 = UTC 01:33（错开整点高峰）
+    - cron: "33 1 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ikuuu-checkin-autologin
+  cancel-in-progress: true
+
+env:
+  RUN_ENV: 'prod'
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10.16'
+
+      - name: Random sleep
+        if: github.event_name == 'schedule'
+        run: sleep $(shuf -i 10-60 -n 1)
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 拉取 GeekedTest 求解器，并去掉用不到的 slide/icon/gobang 依赖（省去 opencv/ddddocr 大依赖）
+      - name: Fetch geeked solver
+        run: |
+          git clone --depth 1 https://github.com/xKiian/GeekedTest.git temp_geeked
+          python -c "
+          with open('temp_geeked/geeked/sign.py', 'r', encoding='utf-8') as f:
+              code = f.read()
+          code = code.replace('from geeked.slide import SlideSolver', 'SlideSolver = None')
+          code = code.replace('from geeked.gobang import GobangSolver', 'GobangSolver = None')
+          code = code.replace('from geeked.icon import IconSolver', 'IconSolver = None')
+          with open('temp_geeked/geeked/sign.py', 'w', encoding='utf-8') as f:
+              f.write(code)
+          "
+          mv temp_geeked/geeked ./geeked
+          rm -rf temp_geeked
+
+      - name: Run checkin
+        env:
+          IKUUU_EMAIL: ${{ secrets.IKUUU_EMAIL }}
+          IKUUU_PASSWD: ${{ secrets.IKUUU_PASSWD }}
+          IKUUU_DOMAINS: ${{ vars.IKUUU_DOMAINS }}
+          IKUUU_CAPTCHA_ID: ${{ vars.IKUUU_CAPTCHA_ID }}
+          SCKEY: ${{ secrets.SCKEY }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: python3 main.py
