@@ -31,9 +31,17 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # ddddocr 依赖 opencv，无头环境需要 libGL / libglib
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgl1 libglib2.0-0
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
+
+      - name: Verify OCR
+        # 不设成致命错误：ddddocr 缺失时脚本仍会降级运行，只是点选题成功率低
+        run: |
+          python -c "import ddddocr; print('ddddocr ok')" || echo "::warning::ddddocr 不可用，点选题将退化"
 
       - name: Run checkin
         env:
