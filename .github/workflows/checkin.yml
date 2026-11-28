@@ -19,6 +19,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Check code version
+        # 拦在第一步：仓库里还是旧代码就直接红，不要白跑 20 分钟
+        run: |
+          if ! grep -q "^VERSION = " main.py; then
+            echo "::error::main.py 里没有 VERSION 标记，仓库里还是旧代码，请先提交 v4"
+            exit 1
+          fi
+          grep -m1 "^VERSION = " main.py
+
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
