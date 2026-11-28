@@ -68,6 +68,11 @@ ZHIPU_API_KEY = os.environ.get('ZHIPU_API_KEY', '').strip()
 SCKEY = os.environ.get('SCKEY', '').strip()
 PUSHPLUS_TOKEN = os.environ.get('PUSHPLUS_TOKEN', '').strip()
 
+VERSION = 'v4.0-2026-11-28'
+
+# 当前正在处理的域名，fetch_image 用它拼 referer
+_CUR_DOMAIN = DOMAINS[0] if DOMAINS else 'ikuuu.top'
+
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
 
@@ -227,13 +232,16 @@ def upscale_png(data, factor=3, max_side=1400):
     return img_to_png(img)
 
 
-def fetch_image(url, referer='https://ikuuu.top/'):
-    """下载极验的背景图资源（原始分辨率，比元素截图更清晰）"""
+def fetch_image(url, referer=None):
+    """下载极验的背景图资源（原始分辨率，比元素截图更清晰）。
+    referer 必须跟当前域名一致：写死 ikuuu.top 时，.pw/.org 的图会取不到，
+    只能退化成元素截图，截到的是 yqkx/jfdl 这种随机字母占位符。"""
     if not url or not url.startswith('http'):
         return None
+    ref = referer or f'https://{_CUR_DOMAIN}/'
     try:
         r = requests.get(url, timeout=15,
-                         headers={'user-agent': UA, 'referer': referer})
+                         headers={'user-agent': UA, 'referer': ref})
         if r.ok and len(r.content) > 100:
             return r.content
     except Exception:
@@ -654,8 +662,9 @@ def load_ref_image(st, page, max_wait=3):
     ref = None
     for _ in range(max_wait):
         src = st.get('quesSrc') or st.get('quesBg')
-        # img 存在但还没加载完：此时 src 指向的是随机字母占位图，必须等
-        if src and not st.get('quesImgOk'):
+        # 没有 img 元素、或 img 还没加载完：此时截到的是 yqkx/jfdl 这类随机字母占位符，先等
+        need_wait = (not src) or (st.get('quesSrc') and not st.get('quesImgOk'))
+        if need_wait:
             page.wait_for_timeout(900)
             st = captcha_state(page)
             src = st.get('quesSrc') or st.get('quesBg')
@@ -917,6 +926,8 @@ def vlm_solve(page, domain):
 
 def try_domain(domain):
     """在单个域名上完成登录 + 签到，返回 (是否成功, 消息)"""
+    global _CUR_DOMAIN
+    _CUR_DOMAIN = domain
     print(f'\n--- 域名 {domain} ---')
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -1028,7 +1039,8 @@ def try_domain(domain):
 
 
 def main():
-    print('=== iKUUU 每日签到（浏览器自动登录版）===')
+    print(f'=== iKUUU 每日签到 [{VERSION}] ===')
+    print('（如果你的日志里看不到上面这行版本号，说明跑的还不是这份代码）')
     if not EMAIL or not PASSWD:
         print('[FATAL] 未设置 IKUUU_EMAIL / IKUUU_PASSWD')
         push('❌ ikuuu 签到失败', '未配置账号密码，请检查 Secrets')

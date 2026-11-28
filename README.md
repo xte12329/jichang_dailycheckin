@@ -82,6 +82,21 @@ v4 会检查 `img.complete && img.naturalWidth > 4`，识别结果里没有汉�
 
 另外 v3 日志里 `['锕','锝','锝',... 200 个]` 是模型复读，v4 已做去重保序 + 日志截断。
 
+### referer 写死导致 .pw/.org 取不到参考图
+
+v3 日志里这个现象很整齐：
+
+| 域名 | 参考图识别结果 |
+|---|---|
+| `ikuuu.top` | `['炒','肝','片']`（真值）或 `['锝','镉','钡']`（误读，但确实是图） |
+| `ikuuu.pw` | `'yqkx'` |
+| `ikuuu.org` | `'jfdl'` / `'yqjfd'` |
+
+`fetch_image()` 的 referer 被硬编码成 `https://ikuuu.top/`，在 `.pw` / `.org` 上
+极验的 CDN 拒绝了这个跨域 referer，`requests` 拿到空内容 → 退回元素截图 →
+截到的是**还没加载出图的占位符**。已改为 `_CUR_DOMAIN` 动态拼接，`try_domain`
+进来第一件事就是设置当前域名。
+
 ### 为什么参考图不用 ddddocr
 
 实测 `ddddocr` 的检测器是**场景文字模型**，对白底干净的提示图（72×24 / 128×128）
@@ -103,6 +118,11 @@ v4 会检查 `img.complete && img.naturalWidth > 4`，识别结果里没有汉�
 | `.github/workflows/checkin.yml` | `.github/workflows/checkin.yml` |
 
 建议删掉旧的 `main.yml`、`main2.yml`，避免重复签到。
+
+> **怎么确认换的是新代码**：`main.py` 第 71 行有 `VERSION = 'v4.0-2026-11-28'`，
+> 启动第一行会打印 `=== iKUUU 每日签到 [v4.0-2026-11-28] ===`。
+> workflow 第一步 `Check code version` 也会 grep 这个标记，仓库里是旧代码会**直接报错退出**，
+> 不会白跑 20 分钟。日志里看不到版本号 = 跑的不是这份代码。
 
 ### 3. 配置 Secrets
 `Settings → Secrets and variables → Actions → Secrets`：
