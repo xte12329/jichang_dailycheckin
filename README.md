@@ -19,6 +19,25 @@
 
 每次都是全新登录，彻底不依赖会过期的长期 cookie，同时自动轮换域名。
 
+## v3.1 实测修正（2026-11-28，本地真实浏览器验证）
+
+用本地 Chromium 打开 ikuuu.top 登录页逐项实测，修掉两个必错 bug：
+
+1. **验证码类型确实会随机切换**：实测同一页面连续出现 `click`（文字点选）和 `nine`（九宫格）。
+   `captcha_state()` 的判型选择器（`.geetest_nine`/`.geetest_click`/`.geetest_item_wrap`）
+   与真实 DOM **完全一致**，判型可靠。`window.Captcha.isReady()` 确实存在且可靠
+   （源码里 `isReady()` = 检查 `geetestV4Result.lot_number`，验证成功才有值）。
+2. **参考图来源（致命 bug）**：极验 V4 的参考图是 `<img src>`（原图 128~200px），
+   **不是 background-image**（`getComputedStyle().backgroundImage` 恒为 `none`）。
+   旧代码只读 background → 参考图永远为空。已改为从 `<img src>` 下载原图。
+3. **文字点选题的待点字来源（致命 bug）**：ikuuu 的 tips 只是
+   「请在下图依次点击,看不清可刷新」，**不含具体字**。真正要点的字在参考图里
+   （如「炒肝片」）。旧代码 `parse_click_chars(tips)` 会解析出
+   `['在','下','图','看','不','清']` 这种完全错误的字，必点错。
+   已改为 `recognize_ref_chars()` 从参考图用 VLM 读字。
+   - 注意参考图有两种：文字型（读出「炒肝片」直接点字）和图标型
+     （如门窗图标，需识别成物体名去图里找对应字）。
+
 ## 部署步骤
 
 ### 1. 仓库准备
