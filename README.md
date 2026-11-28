@@ -74,7 +74,11 @@ Actions 页 → **Run workflow** 手动跑一次。
   已改为 `python-version: '3.10'`（自动选该系列最新可用版），**切勿写死成 `3.10.16`**。
 - checkout / setup-python / upload-artifact 已升级到 v7，避免 Node 20 弃用告警。
 - **`ModuleNotFoundError: No module named 'sniffio'`**：`zhipuai` SDK 在 Actions 的 Python 3.10 环境里缺依赖。已移除 zhipuai SDK，改用 `requests` 直连智谱 OpenAI 兼容接口 `https://open.bigmodel.cn/api/paas/v4/chat/completions`，**不要再装 zhipuai**。
-- **视觉模型返回了格子编号但格子点不中**：原因是 GeeTest V4 的九宫格 DOM 里根本没有 `.geetest_face` 这类元素，CSS 选择器全部落空。已改为樱花 Frp 项目验证过的方案：用 `.geetest_table_box` 定位容器、等图片加载完成、`bounding_box()` 算 3x3 格子中心坐标、`page.mouse.click(x, y)` 坐标点击。同时改成「先识别题目 → 整图直选 → 逐格识别兜底」两步法，准确率更高。
+- **视觉模型返回了格子编号但格子点不中**：GeeTest V4 的 DOM 里没有 `.geetest_face` 这类元素，CSS 选择器全部落空。
+- **`未找到九宫格容器 .geetest_table_box`**：这个类名是樱花 Frp 项目里的，ikuuu 的验证码 DOM **完全没有这个类**（3 个域名、每域名 2 次尝试全部如此）。说明不同站点 GeeTest 容器类名不一样，不能再靠猜类名。已彻底重写 `vlm_solve`：
+  - 不再依赖任何具体类名，改为**整页截图 + VLM 直接输出归一化坐标 (0-1000) + `page.mouse.click`**；
+  - 用启发式 `find_grid_area()` 按元素尺寸/子元素数量探测九宫格区域（仅作参考，不阻塞流程）；
+  - 首次进入时 `dump_geetest_dom()` 会把页面上所有 `geetest` 元素的真实 class/位置**打印到日志**——下次 run 若仍失败，看日志开头的 `[诊断]` 段即可拿到真实 DOM 结构，一次性修对。
 - **必须用 Actions 页的「Run workflow」重新触发**，不要点旧 run 的「Re-run jobs」——后者会用旧代码提交重跑，改了文件也不生效（`run_attempt` 会递增但代码不变）。
 - 协议求解方案失败的根因已记录在上文，不要退回 GeekedTest 方案。
 

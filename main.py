@@ -62,6 +62,7 @@ UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
 
 MAX_CAPTCHA_RETRY = 3
+_LAST_DOM_DUMPED = False  # DOM 结构只 dump 一次，避免日志刷屏
 
 
 def push(title, content):
@@ -145,6 +146,99 @@ def parse_json_array(text):
         return data if isinstance(data, list) else []
     except Exception:
         return []
+
+
+def parse_json_obj(text):
+    """从模型输出里提取 JSON 对象"""
+    if not text:
+        return {}
+    cleaned = re.sub(r'```[a-zA-Z]*', '', text).replace('```', '').strip()
+    m = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(0))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def dump_geetest_dom(page):
+    """把页面上所有 geetest 相关元素的真实结构打印到日志（关键诊断）"""
+    try:
+        nodes = page.evaluate("""() => {
+            const all = Array.from(document.querySelectorAll('*'));
+            const out = [];
+            for (const el of all) {
+                const cls = (el.className && el.className.toString()) || '';
+                if (!/geetest|captcha|verify/i.test(cls)) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 5 || r.height < 5) continue;
+                const cs = getComputedStyle(el);
+                out.push({
+                    tag: el.tagName,
+                    cls: cls.slice(0, 140),
+                    x: Math.round(r.x), y: Math.round(r.y),
+                    w: Math.round(r.width), h: Math.round(r.height),
+                    vis: cs.visibility, disp: cs.display,
+                    text: (el.innerText || '').trim().slice(0, 40)
+                });
+            }
+            return out.slice(0, 60);
+        }""")
+        print(f'[诊断] geetest 元素共 {len(nodes)} 个:')
+        for n in nodes:
+            print(f"   {n['tag']:6s} [{n['x']},{n['y']} {n['w']}x{n['h']}] "
+                  f"{n['cls']}" + (f" | {n['text']}" if n['text'] else ''))
+    except Exception as e:
+        print(f'[诊断] DOM dump 失败: {e}')
+
+
+def find_grid_area(page):
+    """启发式找九宫格区域 bbox（不依赖具体类名）。返回 dict 或 None"""
+    try:
+        cands = page.evaluate("""() => {
+            const out = [];
+            const nodes = document.querySelectorAll('div,section,canvas,img,ul');
+            for (const el of nodes) {
+                const r = el.getBoundingClientRect();
+                const w = r.width, h = r.height;
+                if (w < 140 || h < 140 || w > 480 || h > 480) continue;
+                const aspect = w / h;
+                if (aspect < 0.65 || aspect > 1.5) continue;
+                if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) continue;
+                const cs = getComputedStyle(el);
+                if (cs.visibility === 'hidden' || cs.display === 'none' ||
+                    parseFloat(cs.opacity || '1') < 0.5) continue;
+                const kids = Array.from(el.children).filter(k => {
+                    const kr = k.getBoundingClientRect();
+                    return kr.width > 25 && kr.height > 25;
+                }).length;
+                const cls = (el.className && el.className.toString()) || '';
+                let score = 0;
+                if (kids >= 9 && kids <= 12) score += 80;
+                else if (kids >= 4 && kids <= 16) score += 30;
+                if (/geetest|table|grid|nine|captcha|puzzle/i.test(cls)) score += 50;
+                if (w >= 200 && h >= 200) score += 10;
+                out.push({x: r.x, y: r.y, w: w, h: h, kids: kids,
+                          cls: cls.slice(0, 100), tag: el.tagName, score: score});
+            }
+            out.sort((a, b) => b.score - a.score);
+            return out.slice(0, 10);
+        }""")
+    except Exception as e:
+        print(f'[诊断] 区域探测失败: {e}')
+        return None
+    if not cands:
+        return None
+    print('[诊断] 九宫格候选区域:')
+    for c in cands[:6]:
+        print(f"   {c['tag']:6s} {c['w']:.0f}x{c['h']:.0f} kids={c['kids']} "
+              f"score={c['score']} .{c['cls']}")
+    best = cands[0]
+    if best['score'] <= 0:
+        return None
+    return best
 
 
 def clean_name(text):
@@ -241,128 +335,108 @@ def describe_cells(cells):
     return results
 
 
+def extract_target(page):
+    """从页面文本里提取题目，如『请点击图中所有的猫』-> 猫"""
+    try:
+        body = page.locator('body').inner_text(timeout=1500)
+    except Exception:
+        return ''
+    patterns = [
+        r'请[点击选出找]*[图中]*所有[的是]?\s*[「"【]?([^，。,、\n\s]{1,10})',
+        r'请[点击选出找]*([^，。,、\n\s]{2,10})[的图]',
+        r'点击[^，。,、\n]{0,8}([一-龥]{1,8})',
+    ]
+    for pat in patterns:
+        m = re.search(pat, body)
+        if m:
+            t = clean_name(m.group(1))
+            if t and len(t) >= 1:
+                print(f'[验证码] 文字题目: {t!r}')
+                return t
+    return ''
+
+
 def vlm_solve(page, domain):
-    """用智谱视觉模型识别九宫格并点击，返回是否通过"""
+    """用智谱视觉模型识别点选验证码并点击，返回是否通过。
+    不依赖具体 CSS 类名：先启发式定位九宫格区域，定位不到就用整页截图 +
+    VLM 输出归一化坐标点击。同时把真实 DOM 结构打印到日志便于诊断。"""
+    global _LAST_DOM_DUMPED
     if not ZHIPU_API_KEY:
         print('[验证码] 未配置 ZHIPU_API_KEY')
         return False
 
-    container = page.locator('.geetest_table_box').first
-    try:
-        if not container.is_visible(timeout=3000) or container.count() == 0:
-            print('[验证码] 未找到九宫格容器 .geetest_table_box')
-            return False
-    except Exception:
-        print('[验证码] 九宫格容器不可见')
-        return False
+    safe = domain.replace('.', '_')
 
-    # 关键：等图片加载完成再截图
-    wait_grid_loaded(page)
+    # 关键诊断：第一次进入时把真实 DOM 结构打出来
+    if not _LAST_DOM_DUMPED:
+        dump_geetest_dom(page)
+        _LAST_DOM_DUMPED = True
 
-    # 步骤1：识别题目（图片提示或文字提示）
-    target = ''
-    tip = page.locator('.geetest_tip_img').first
+    page.wait_for_timeout(600)  # 等弹窗动画稳定
+
+    # 1. 先截整页（题目和九宫格都在里面），保存供排查
     try:
-        if tip.count() and tip.is_visible(timeout=1500):
-            tip_bytes = tip.screenshot()
-            with open(f'captcha_{domain.replace(".", "_")}_tip.png', 'wb') as f:
-                f.write(tip_bytes)
-            target = clean_name(vlm_chat(
-                '这是验证码的题目提示图，图中只有一个物体。只回答该物体的中文名称，不要解释。',
-                [tip_bytes]))
-            print(f'[验证码] 图片题目: {target!r}')
+        full_bytes = page.screenshot()
+        with open(f'captcha_{safe}.png', 'wb') as f:
+            f.write(full_bytes)
     except Exception as e:
-        print(f'[验证码] 图片题目识别失败: {e}')
-
-    if not target:
-        try:
-            tip_text = page.locator('.geetest_tip_content').first
-            if tip_text.count() and tip_text.is_visible(timeout=1500):
-                target = clean_name(tip_text.inner_text())
-                print(f'[验证码] 文字题目: {target!r}')
-        except Exception:
-            pass
-
-    if not target:
-        print('[验证码] 未识别到题目，本轮放弃')
+        print(f'[验证码] 整页截图失败: {e}')
         return False
 
-    # 步骤2：截九宫格整图
-    try:
-        grid_bytes = container.screenshot()
-        with open(f'captcha_{domain.replace(".", "_")}.png', 'wb') as f:
-            f.write(grid_bytes)
-    except Exception as e:
-        print(f'[验证码] 九宫格截图失败: {e}')
-        return False
+    # 2. 启发式定位九宫格区域
+    grid = find_grid_area(page)
+    target = extract_target(page)
+    print(f'[验证码] 题目: {target or "(未提取到，让模型自行判断)"}')
 
-    # 步骤3：整图直选
-    cells = []
+    # 3. 让模型直接给出要点击的格子在截图中的归一化坐标(0-1000)
+    #    这样彻底绕开 DOM 类名和 bounding box 计算
+    hint = f'题目要求找出【{target}】。' if target else ''
     try:
         raw = vlm_chat(
-            f'这是一张 3x3 九宫格验证码。格子编号：第一行 1、2、3，第二行 4、5、6，'
-            f'第三行 7、8、9。请找出所有内容是【{target}】的格子（同类的不同角度、'
-            f'材质、玩具模型也算命中）。只返回 JSON 整数数组如 [1,5]，没有则 []，不要解释。',
-            [grid_bytes])
-        print(f'[验证码] 整图直选: {raw!r}')
-        cells = normalize_cells(parse_json_array(raw))
+            '这是一张 GeeTest 点选验证码截图，中央有一个 3x3 九宫格图片，'
+            '上方有文字题目说明要点击什么。' + hint +
+            '请仔细观察题目和九宫格，找出所有符合题意的格子。\n'
+            '以 0-1000 的归一化坐标返回每个要点击格子的中心点（左上角为 0,0，右下角为 1000,1000）。\n'
+            '另外返回九宫格区域边界框。只返回 JSON，例如：\n'
+            '{"box":[300,250,700,650],"points":[[380,330],[620,570]]}\n'
+            '没有符合的格子 points 返回 []，不要解释。',
+            [full_bytes])
+        print(f'[验证码] 模型输出: {raw!r}')
     except Exception as e:
-        print(f'[验证码] 整图直选失败: {e}')
-
-    # 步骤4：逐格识别兜底
-    if not cells:
-        print('[验证码] 整图直选无结果，改逐格识别')
-        crop = crop_cells(grid_bytes)
-        if crop:
-            names = describe_cells(crop)
-            print(f'[验证码] 逐格识别: {names}')
-            hits = [i + 1 for i, n in enumerate(names)
-                    if n not in ('空白', '未知', '') and (target in n or n in target)]
-            if hits:
-                cells = normalize_cells(hits)
-                print(f'[验证码] 名称匹配: {cells}')
-            else:
-                try:
-                    raw = vlm_chat(
-                        f'题目是找出所有【{target}】。9 个格子的识别结果：\n'
-                        + '\n'.join(f'{i+1}. {n}' for i, n in enumerate(names))
-                        + '\n判断哪些格子属于该类（含同义词、上下位词，空白/未知不算）。'
-                        '只返回 JSON 整数数组，不要解释。', [])
-                    cells = normalize_cells(parse_json_array(raw))
-                    print(f'[验证码] 语义裁决: {cells}')
-                except Exception as e:
-                    print(f'[验证码] 语义裁决失败: {e}')
-
-    if not cells:
-        print('[验证码] 本轮无有效格子，稍后刷新')
+        print(f'[验证码] 模型调用失败: {e}')
         return False
 
-    # 步骤5：按坐标点击（樱花项目验证过的方式，绕开 CSS 选择器）
-    try:
-        box = container.bounding_box()
-        cw, ch = box['width'] / 3, box['height'] / 3
-        print(f'[验证码] 容器 {box["width"]:.0f}x{box["height"]:.0f}, 格子 {cw:.0f}x{ch:.0f}')
-        clicked = 0
-        for val in cells:
-            r, c = (val - 1) // 3, (val - 1) % 3
-            x = box['x'] + c * cw + cw / 2 + random.uniform(-cw * 0.1, cw * 0.1)
-            y = box['y'] + r * ch + ch / 2 + random.uniform(-ch * 0.1, ch * 0.1)
-            page.mouse.click(x, y)
-            clicked += 1
-            time.sleep(random.uniform(0.3, 0.6))
-        print(f'[验证码] 已点击 {clicked} 个格子: {cells}')
-        if clicked == 0:
-            return False
-    except Exception as e:
-        print(f'[验证码] 坐标点击失败: {e}')
+    data = parse_json_obj(raw)
+    points = data.get('points') or []
+    validated = []
+    for p in points:
+        try:
+            x, y = float(p[0]), float(p[1])
+            if 0 <= x <= 1000 and 0 <= y <= 1000:
+                validated.append((x, y))
+        except Exception:
+            continue
+    if not validated:
+        print('[验证码] 模型未给出有效坐标，本轮放弃')
         return False
 
-    # 步骤6：提交
+    # 4. 把归一化坐标映射到页面像素并点击
+    vw, vh = page.viewport_size['width'], page.viewport_size['height']
+    print(f'[验证码] 点击 {len(validated)} 个坐标 (视口 {vw}x{vh})')
+    for nx, ny in validated:
+        x = nx / 1000.0 * vw
+        y = ny / 1000.0 * vh
+        page.mouse.click(x, y)
+        time.sleep(random.uniform(0.25, 0.45))
+
+    # 5. 提交（多类名兜底）
     page.wait_for_timeout(300)
-    click_first(page, ['.geetest_commit', '.geetest_submit', 'text=确认'])
+    click_first(page, [
+        '.geetest_commit', '.geetest_submit', '.geetest_btn_submit',
+        '[class*="commit"]', '[class*="submit"]', 'text=确认', 'text=提交',
+    ])
     page.wait_for_timeout(2000)
 
-    # 判断是否通过
     if captcha_ready(page):
         print('[验证码] 通过')
         return True
@@ -418,8 +492,14 @@ def try_domain(domain):
                 if vlm_solve(page, domain):
                     ok = True
                     break
-                # 刷新验证码再试（樱花项目验证过的刷新按钮）
-                click_first(page, ['.geetest_refresh', '[class*="geetest_refresh"]'])
+                # 刷新验证码再试：多类名兜底；实在找不到就重新点验证按钮
+                refreshed = click_first(page, [
+                    '.geetest_refresh', '[class*="refresh"]',
+                    '.geetest_btn_click', '[class*="geetest_btn"]',
+                ])
+                if not refreshed:
+                    print('[验证码] 未找到刷新按钮，重新点验证按钮')
+                    click_first(page, ['.geetest_btn_click', '[class*="geetest_btn"]'])
                 page.wait_for_timeout(1200)
 
         if not ok:
