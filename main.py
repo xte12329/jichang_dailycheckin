@@ -5,21 +5,21 @@ iKUUU 机场每日签到 - 浏览器自动登录版
 
 ikuuu 现在随机返回三种 GeeTest V4 验证码：
   nine  九宫格（选 N 个与参考图标相同的格子）
-  click 文字点选（按题目顺序点击指定的字）
+  click 文字点选（按参考图顺序点击指定的字）
   icon  图标点选（暂不处理，答错后会自动换题）
 
-v3 修复要点（对照 v2 的失败日志）：
-  1. 先读 DOM 判定验证码类型，不再"一套逻辑打天下"；
-  2. 九宫格改为「命名 + 文本匹配 + 按元素点击」：
-     参考图标和 9 个格子分别截图，让视觉模型只输出物体名称，
-     再按名称匹配选格子，最后用 Playwright 点 .geetest_item_wrap[i]。
-     全程零坐标回归，彻底绕开模型编坐标的问题；
-  3. 九宫格题目是图标而不是文字，不再从 body 里正则抓文字当题目；
-  4. 从"选 3 个符合右图的图片"里解析出需要选几个，严格点够数量；
-  5. 文字点选只截验证码区域，按题目字符逐个问归一化坐标（0-1），
-     再映射回该元素的 CSS 盒子，避免全页坐标和 DPR 偏差；
-  6. 答错后极验会自动换新题，重试时只等新题并重新判型，
-     不再盲目点 .geetest_refresh。
+v4 修复要点（对照 v3 的失败日志）：
+  1. 参考图必须等真正加载完：占位状态下 ques_tips 里是随机字母
+     （日志里的 yqkx / jfdl），此时识别必然得到一堆幻觉生僻字
+     （锝/镉/钡）。现在识别到纯字母就等待重试，最多 3 次。
+  2. 点选题彻底放弃「让 VLM 输出坐标」——GLM-4V 没有定位能力，
+     v3 日志里三次点击 x 全是 640（正好是 300 宽区域的中线）。
+     改为：ddddocr 检测文字框 → 逐框裁图放大 → VLM 只认单字
+     → 按字匹配框 → 点框中心。坐标全部来自 OCR，模型只负责认字。
+  3. 目标字在检测结果里找不到 → 说明参考图识别错了，点刷新换一道题，
+     不硬猜。刷新最多 3 次，避免触发风控。
+  4. 单字识别结果去重保序，避免模型复读把日志刷爆（v3 出现过 200 个「锝」）。
+  5. 重试次数上调：验证码本质是概率游戏。
 
 环境变量：
   IKUUU_EMAIL      必填，账号邮箱
@@ -31,7 +31,6 @@ v3 修复要点（对照 v2 的失败日志）：
 """
 import base64
 import io
-import json
 import os
 import random
 import re
@@ -45,6 +44,11 @@ try:
     from PIL import Image
 except ImportError:
     Image = None
+
+try:
+    import ddddocr
+except Exception:
+    ddddocr = None
 
 # === 强制 UTF-8 输出 ===
 if sys.stdout.encoding != 'utf-8':
@@ -67,14 +71,17 @@ PUSHPLUS_TOKEN = os.environ.get('PUSHPLUS_TOKEN', '').strip()
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
 
-MAX_CAPTCHA_RETRY = 3
-_LAST_DOM_DUMPED = False  # DOM 结构只 dump 一次，避免日志刷屏
-# 视觉模型调用总量上限：一次运行最多花这么多次，防止验证码连续失败时烧穿免费额度
-MAX_VLM_CALLS = 80
+MAX_CAPTCHA_RETRY = 5   # 单个域名内，验证码最多重试几轮
+DOMAIN_RETRY = 2        # 单个域名最多整体尝试几次
+MAX_REFRESH = 3         # 识别不确定时最多刷新换题几次
+_LAST_DOM_DUMPED = False
+# 视觉模型调用总量上限，防止连续失败烧穿免费额度
+MAX_VLM_CALLS = 500
 _vlm_calls = 0
 
 # 九宫格里这些回答代表"没有可用物体"，不参与匹配
-EMPTY_WORDS = {'空白', '未知', '无', '没有', '看不出', '空'}
+EMPTY_WORDS = {'空白', '未知', '无', '没有', '看不出', '空',
+               '白色背景', '纯色', '背景', '纯白'}
 
 
 def push(title, content):
@@ -122,12 +129,14 @@ def click_first(page, selectors, timeout=2500):
     return False
 
 
-def vlm_chat(prompt, images):
+# ---------------------------------------------------------------- 视觉模型
+
+def vlm_chat(prompt, images, retries=2):
     """调用智谱 OpenAI 兼容接口，images 为图片字节列表，返回文本"""
     global _vlm_calls
     if _vlm_calls >= MAX_VLM_CALLS:
-        raise RuntimeError(f'视觉模型调用已达上限 {MAX_VLM_CALLS} 次')
-    _vlm_calls += 1
+        print(f'[验证码] 视觉模型调用已达上限 {MAX_VLM_CALLS} 次，跳过')
+        return ''
     content = [{'type': 'text', 'text': prompt}]
     for img in images:
         if not img:
@@ -135,40 +144,44 @@ def vlm_chat(prompt, images):
         b64 = base64.b64encode(img).decode('utf-8')
         content.append({'type': 'image_url',
                         'image_url': {'url': f'data:image/png;base64,{b64}'}})
-    resp = requests.post(
-        'https://open.bigmodel.cn/api/paas/v4/chat/completions',
-        headers={'Authorization': f'Bearer {ZHIPU_API_KEY}',
-                 'Content-Type': 'application/json'},
-        json={'model': 'glm-4v-flash',
-              'messages': [{'role': 'user', 'content': content}]},
-        timeout=60,
-    )
-    result = resp.json()
-    if 'error' in result:
-        raise RuntimeError(result['error'])
-    return (result['choices'][0]['message']['content'] or '').strip()
 
-
-def parse_json_obj(text):
-    """从模型输出里提取 JSON 对象"""
-    if not text:
-        return {}
-    cleaned = re.sub(r'```[a-zA-Z]*', '', text).replace('```', '').strip()
-    m = re.search(r'\{.*\}', cleaned, re.DOTALL)
-    if not m:
-        return {}
-    try:
-        data = json.loads(m.group(0))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    last_err = None
+    for i in range(retries + 1):
+        _vlm_calls += 1
+        try:
+            resp = requests.post(
+                'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+                headers={'Authorization': f'Bearer {ZHIPU_API_KEY}',
+                         'Content-Type': 'application/json'},
+                json={'model': 'glm-4v-flash', 'temperature': 0.01,
+                      'messages': [{'role': 'user', 'content': content}]},
+                timeout=60,
+            )
+            result = resp.json()
+            if 'error' in result:
+                msg = str(result['error'])
+                last_err = msg
+                # 429 / 限流：退避后重试
+                if i < retries and ('429' in msg or 'rate' in msg.lower()
+                                    or '频繁' in msg or '1305' in msg):
+                    time.sleep(1.5 * (i + 1))
+                    continue
+                print(f'[验证码] 视觉模型返回错误: {msg[:160]}')
+                return ''
+            return (result['choices'][0]['message']['content'] or '').strip()
+        except Exception as e:
+            last_err = f'{type(e).__name__}: {e}'
+            if i < retries:
+                time.sleep(1.5 * (i + 1))
+                continue
+    print(f'[验证码] 视觉模型调用失败: {last_err}')
+    return ''
 
 
 def clean_name(text):
     """把模型输出的物体名称清洗成短词"""
     if not text:
         return ''
-    # 先去掉 markdown 代码块围栏，否则首行会变成 "json"
     t = re.sub(r'```[a-zA-Z]*', '', text).replace('```', '').strip()
     lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
     if not lines:
@@ -181,25 +194,37 @@ def clean_name(text):
 
 # ---------------------------------------------------------------- 图像工具
 
+def open_img(data):
+    """PNG 字节 -> PIL Image"""
+    if not data or Image is None:
+        return None
+    try:
+        return Image.open(io.BytesIO(data)).convert('RGB')
+    except Exception:
+        return None
+
+
+def img_to_png(img):
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
+
+
 def upscale_png(data, factor=3, max_side=1400):
     """放大图片，让小图标/小字能被视觉模型看清"""
-    if not data or Image is None:
-        return data
-    try:
-        img = Image.open(io.BytesIO(data)).convert('RGB')
-    except Exception:
+    img = open_img(data)
+    if img is None:
         return data
     w, h = img.size
     if w < 8 or h < 8:
         return data
-    f = factor
+    f = float(factor)
     if max(w, h) * f > max_side:
         f = max(1.0, max_side / float(max(w, h)))
-    if f > 1.05:
-        img = img.resize((max(1, int(w * f)), max(1, int(h * f))), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    return buf.getvalue()
+    if f <= 1.05:
+        return data
+    img = img.resize((max(1, int(w * f)), max(1, int(h * f))), Image.LANCZOS)
+    return img_to_png(img)
 
 
 def fetch_image(url, referer='https://ikuuu.top/'):
@@ -225,6 +250,221 @@ def shot_el(page, selector, idx=0):
         return loc.nth(idx).screenshot(timeout=3000)
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------- OCR 定位
+
+_DET = None
+_DET_TRIED = False
+_OCR = None
+_OCR_TRIED = False
+
+
+def get_det():
+    """懒加载 ddddocr 的文字检测器"""
+    global _DET, _DET_TRIED
+    if _DET_TRIED:
+        return _DET
+    _DET_TRIED = True
+    if ddddocr is None:
+        print('[验证码] 未安装 ddddocr，点选题只能靠模型猜坐标（成功率很低）')
+        return None
+    for kwargs in ({'det': True, 'show_ad': False}, {'det': True}):
+        try:
+            _DET = ddddocr.DdddOcr(**kwargs)
+            print('[验证码] 文字检测器已就绪 (ddddocr)')
+            return _DET
+        except TypeError:
+            continue
+        except Exception as e:
+            print(f'[验证码] 文字检测器初始化失败: {type(e).__name__}: {e}')
+            return None
+    return None
+
+
+def get_ocr():
+    """懒加载 ddddocr 的单字分类器（免费，比调 API 快得多）"""
+    global _OCR, _OCR_TRIED
+    if _OCR_TRIED:
+        return _OCR
+    _OCR_TRIED = True
+    if ddddocr is None:
+        return None
+    for kwargs in ({'show_ad': False}, {}):
+        try:
+            _OCR = ddddocr.DdddOcr(**kwargs)
+            print('[验证码] 单字分类器已就绪 (ddddocr)')
+            return _OCR
+        except TypeError:
+            continue
+        except Exception as e:
+            print(f'[验证码] 单字分类器初始化失败: {type(e).__name__}: {e}')
+            return None
+    return None
+
+
+def ocr_boxes(img_bytes):
+    """文字检测，返回 [[x1,y1,x2,y2], ...]（相对传入图片的像素）"""
+    det = get_det()
+    if det is None or not img_bytes:
+        return []
+    try:
+        res = det.detection(img_bytes)
+        return [b for b in (res or []) if len(b) >= 4]
+    except Exception as e:
+        print(f'[验证码] 文字检测异常: {type(e).__name__}: {e}')
+        return []
+
+
+def ocr_boxes_best(img_bytes):
+    """检测文字框。原图对比度低时再试一次灰度增强版，取框更多的那个。"""
+    boxes = ocr_boxes(img_bytes)
+    img = open_img(img_bytes)
+    if img is None or Image is None:
+        return boxes
+    try:
+        from PIL import ImageOps
+        gray = ImageOps.autocontrast(img.convert('L'), cutoff=2).convert('RGB')
+        boxes2 = ocr_boxes(img_to_png(gray))
+        if len(boxes2) > len(boxes):
+            print(f'[验证码] 增强后检出更多文字框: {len(boxes)} -> {len(boxes2)}')
+            return boxes2
+    except Exception:
+        pass
+    return boxes
+
+
+def classify_char(img_bytes):
+    """ddddocr 单字分类（免费），失败返回空串"""
+    ocr = get_ocr()
+    if ocr is None or not img_bytes:
+        return ''
+    try:
+        r = (ocr.classification(img_bytes) or '').strip()
+    except Exception:
+        return ''
+    # 只接受单个汉字，多字说明这一块框住了两个以上字符
+    cs = re.findall(r'[\u4e00-\u9fff]', r)
+    return cs[0] if len(cs) == 1 else ''
+
+
+def recognize_single_char(img_bytes):
+    """识别裁出来的单个汉字"""
+    raw = vlm_chat(
+        '这是从中文验证码图片上裁下来的单个汉字，笔画可能有描边、变形或轻微倾斜。'
+        '只回答这个字本身，一个字。不要解释、不要标点、不要拼音。', [img_bytes])
+    if not raw:
+        return ''
+    cs = re.findall(r'[\u4e00-\u9fff]', raw)
+    return cs[0] if cs else ''
+
+
+def recognize_many(crops):
+    """并发识别一批单字裁图"""
+    results = [''] * len(crops)
+    if not crops:
+        return results
+
+    def worker(i):
+        return i, recognize_single_char(crops[i])
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for i, ch in pool.map(worker, range(len(crops))):
+            results[i] = ch
+    return results
+
+
+def detect_chars(img_bytes, css_w, css_h, scale=2):
+    """
+    对点选大图做「检测 + 裁剪 + 免费分类」。
+    返回 [{cx, cy, crop, name}, ...]，坐标为相对该元素的 CSS 像素。
+    坐标链路：det 坐标 / scale -> 截图设备像素 -> * (css/设备像素) -> CSS
+    """
+    base = open_img(img_bytes)
+    if base is None:
+        return []
+    w, h = base.size
+    if w < 20 or h < 20:
+        return []
+    sx = css_w / float(w) if css_w else 1.0
+    sy = css_h / float(h) if css_h else 1.0
+
+    big = base.resize((w * scale, h * scale), Image.LANCZOS)
+    boxes = ocr_boxes_best(img_to_png(big))
+    print(f'[验证码] 文字检测到 {len(boxes)} 个框')
+    if not boxes:
+        return []
+
+    items = []
+    widths = []
+    for b in boxes:
+        x1, y1, x2, y2 = [float(v) for v in b[:4]]
+        # 还原到 base（设备像素）
+        bx1, by1 = x1 / scale, y1 / scale
+        bx2, by2 = x2 / scale, y2 / scale
+        bw, bh = bx2 - bx1, by2 - by1
+        # 过滤明显不合理的框（整图、细线、极小噪点）
+        if bw < 8 or bh < 8 or bw > w * 0.92 or bh > h * 0.92:
+            continue
+        pad = max(2, int(min(bw, bh) * 0.14))
+        left = max(0, int(bx1 - pad))
+        top = max(0, int(by1 - pad))
+        right = min(w, int(bx2 + pad))
+        bottom = min(h, int(by2 + pad))
+        if right - left < 8 or bottom - top < 8:
+            continue
+        crop = base.crop((left, top, right, bottom))
+        cw, chh = crop.size
+        f = max(2.0, min(6.0, 96.0 / float(max(1, min(cw, chh)))))
+        crop = crop.resize((int(cw * f), int(chh * f)), Image.LANCZOS)
+        png = img_to_png(crop)
+        items.append({
+            'cx': ((bx1 + bx2) / 2.0) * sx,
+            'cy': ((by1 + by2) / 2.0) * sy,
+            'crop': png,
+            'name': classify_char(png),
+            'w': bw,
+            'wide': False,
+        })
+        widths.append(bw)
+
+    # 一个框圈住两个字的（宽度明显超过中位数）ddddocr 会认错，标记为不可信
+    if widths:
+        widths_sorted = sorted(widths)
+        median_w = widths_sorted[len(widths_sorted) // 2]
+        for it in items:
+            if median_w > 0 and it['w'] > median_w * 1.9:
+                it['wide'] = True
+
+    print('[验证码] ddddocr 识别: ' +
+          ' '.join(f'{it["name"] or "?"}{"!" if it["wide"] else ""}'
+                   f'@{it["cx"]:.0f},{it["cy"]:.0f}' for it in items))
+    return items
+
+
+def resolve_char_names(items, targets):
+    """
+    确定每个框里到底是什么字。
+    ddddocr 免费且对单个字符很准，先跑；只有目标字没认全时才调视觉模型兜底。
+    """
+    dd = [it['name'] for it in items]
+    if all(t in dd for t in targets):
+        return dd
+
+    print('[验证码] ddddocr 未认全目标字，调用视觉模型补识别')
+    vlm = recognize_many([it['crop'] for it in items])
+    merged = []
+    for it, d, v in zip(items, dd, vlm):
+        if d in targets and not it['wide']:
+            merged.append(d)        # ddddocr 直接命中，最可信
+        elif v in targets:
+            merged.append(v)        # ddddocr 没命中而模型命中：采信，否则永远找不到
+        elif d and not it['wide']:
+            merged.append(d)
+        else:
+            merged.append(v or d)
+    print('[验证码] 视觉模型识别: ' + ' '.join(x or '?' for x in merged))
+    return merged
 
 
 # ---------------------------------------------------------------- DOM 判型
@@ -276,13 +516,7 @@ def captcha_state(page):
                 const m = v.match(/url\\(["']?(.*?)["']?\\)/);
                 return m ? m[1] : '';
             };
-            // 极验 V4 参考图在 <img src>（原图 200x200），background-image 恒为 none。
-            // 只取 background 会导致参考图永远为空，必须同时取 img src。
-            const refSrcOf = el => {
-                if (!el) return '';
-                const img = el.querySelector('img');
-                return img ? (img.currentSrc || img.src || '') : '';
-            };
+            // 极验 V4 参考图在 <img src>（原图 128~200px），background-image 恒为 none。
             const nineEl = q('.geetest_subitem.geetest_nine');
             const clickEl = q('.geetest_subitem.geetest_click');
             const iconEl = q('.geetest_subitem.geetest_icon');
@@ -290,6 +524,7 @@ def captcha_state(page):
             const bgEl = q('.geetest_bg');
             const tipsEl = q('.geetest_text_tips');
             const quesEl = q('.geetest_ques_tips');
+            const quesImg = quesEl ? quesEl.querySelector('img') : null;
             const tiles = Array.from(document.querySelectorAll('.geetest_item_wrap'));
             return {
                 nine: !!nineEl, click: !!clickEl, icon: !!iconEl,
@@ -298,11 +533,11 @@ def captcha_state(page):
                 tileCount: tiles.length,
                 tips: tipsEl ? (tipsEl.innerText || '').trim() : '',
                 quesBg: bgOf(quesEl),
-                quesSrc: refSrcOf(quesEl),
+                quesSrc: quesImg ? (quesImg.currentSrc || quesImg.src || '') : '',
+                quesImgOk: !!(quesImg && quesImg.complete && quesImg.naturalWidth > 4),
                 quesRect: rect(quesEl),
                 hasQues: !!quesEl,
                 commit: !!q('.geetest_commit'),
-                bodyHint: (document.body.innerText || '').slice(0, 200),
             };
         }""")
     except Exception as e:
@@ -320,6 +555,20 @@ def detect_kind(st):
     return None
 
 
+def refresh_captcha(page):
+    """点极验的刷新按钮换一道题（识别不确定时比硬猜划算）"""
+    try:
+        btn = page.locator('.geetest_refresh').first
+        if btn.count() and btn.is_visible():
+            btn.click(timeout=2000)
+            print('[验证码] 已刷新换题')
+            page.wait_for_timeout(1300)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 # ---------------------------------------------------------------- 文本匹配
 
 def parse_count(tips):
@@ -330,22 +579,6 @@ def parse_count(tips):
         if 1 <= n <= 9:
             return n
     return 3
-
-
-def parse_click_chars(tips):
-    """从「请依次点击『在』『下』」里解析出要点的字（保持顺序）"""
-    if not tips:
-        return []
-    quoted = re.findall(r'[『「“]([^』」”]{1,6})[』」”]', tips)
-    if quoted:
-        chars = []
-        for g in quoted:
-            chars.extend(list(g))
-        return chars[:6]
-    # 兜底：去掉指令性词语后剩下的汉字
-    t = re.sub(r'(请|依次|按照|顺序|点击|选出|图中|文字|下方|上方|的|所有|并|确认)', '', tips)
-    t = re.sub(r'[^\u4e00-\u9fff]', '', t)
-    return list(t)[:6]
 
 
 def char_overlap(a, b):
@@ -378,13 +611,11 @@ def is_same_object(ref_img, cell_img):
     """直接比对：参考图和这个格子里是不是同类物体（比名称匹配更抗同义词）"""
     if not ref_img or not cell_img:
         return False
-    try:
-        raw = vlm_chat(
-            '第一张图是参考物体，第二张图是九宫格中的一个格子。\n'
-            '判断第二张图里是否存在和第一张图相同或同类的物体。\n'
-            '只回答一个字：是 或 否。不要解释。', [ref_img, cell_img])
-    except Exception as e:
-        print(f'[验证码] 比对调用失败: {e}')
+    raw = vlm_chat(
+        '第一张图是参考物体，第二张图是九宫格中的一个格子。\n'
+        '判断第二张图里是否存在和第一张图相同或同类的物体。\n'
+        '只回答一个字：是 或 否。不要解释。', [ref_img, cell_img])
+    if not raw:
         return False
     if '否' in raw or '不' in raw or '无' in raw:
         return False
@@ -401,15 +632,12 @@ def describe_cells(cells):
         img = cells[i]
         if not img:
             return i, '未知'
-        try:
-            raw = vlm_chat(
-                '这是九宫格验证码里的一个格子。只回答格子里最主要物体的中文名称，2-6个字。'
-                '如果有多个物体，只回答最显眼的一个。空白或看不出物体只回答：空白。'
-                '不要解释，不要标点。', [img])
-            return i, (clean_name(raw) or '未知')
-        except Exception as e:
-            print(f'[验证码] 格子 {i + 1} 识别失败: {e}')
-            return i, '未知'
+        raw = vlm_chat(
+            '这是九宫格验证码里的一个格子。用 2-6 个汉字描述格子里最主要的东西：'
+            '颜色 + 物体，例如「红色苹果」「蓝色雨伞」。'
+            '如果画面是空的或只有底色，只回答：空白。'
+            '不要解释，不要标点。', [img])
+        return i, (clean_name(raw) or '未知')
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         for i, name in pool.map(worker, range(len(cells))):
@@ -417,66 +645,63 @@ def describe_cells(cells):
     return results
 
 
-def locate_char(img_png, ch):
-    """在验证码图里定位某个字，返回归一化坐标 (nx, ny)，失败返回 (None, None)"""
-    prompt = (
-        f'这是一张中文点选验证码图片，白色背景上散布着若干汉字。\n'
-        f'请找到字符「{ch}」的位置。\n'
-        f'用相对坐标回答：左上角是 (0,0)，右下角是 (1,1)，取该字中心点。\n'
-        f'只返回 JSON，例如：{{"x":0.42,"y":0.58}}\n'
-        f'如果图里没有这个字，返回 {{"x":null,"y":null}}。不要解释。'
-    )
-    try:
-        raw = vlm_chat(prompt, [img_png])
-    except Exception as e:
-        print(f'[验证码] 定位「{ch}」失败: {e}')
-        return None, None
-    d = parse_json_obj(raw)
-    try:
-        x, y = float(d.get('x')), float(d.get('y'))
-        if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
-            return x, y
-    except Exception:
-        pass
-    # 兜底：从任意文本里抓两个 0-1 之间的小数
-    nums = re.findall(r'0\.\d+|1\.0+|(?<!\d)[01](?!\d)', raw or '')
-    try:
-        if len(nums) >= 2:
-            x, y = float(nums[0]), float(nums[1])
-            if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
-                return x, y
-    except Exception:
-        pass
-    return None, None
+def load_ref_image(st, page, max_wait=3):
+    """
+    取参考图（题目图），并等它从占位符变成真正的图。
+    占位状态下 VLM 会读到随机字母（yqkx/jfdl），必须跳过。
+    返回图片字节，失败返回 None。
+    """
+    ref = None
+    for _ in range(max_wait):
+        src = st.get('quesSrc') or st.get('quesBg')
+        # img 存在但还没加载完：此时 src 指向的是随机字母占位图，必须等
+        if src and not st.get('quesImgOk'):
+            page.wait_for_timeout(900)
+            st = captcha_state(page)
+            src = st.get('quesSrc') or st.get('quesBg')
+        ref = fetch_image(src)
+        if not ref:
+            ref = shot_el(page, '.geetest_ques_tips')
+        if ref:
+            return ref
+        page.wait_for_timeout(700)
+        st = captcha_state(page)
+    return ref
 
 
-# ---------------------------------------------------------------- 两类验证码
+# ---------------------------------------------------------------- 九宫格
 
 def solve_nine(page, st):
     """九宫格：命名参考图 + 命名 9 格 + 文本匹配 + 按元素点击（零坐标）"""
     need = parse_count(st.get('tips'))
     print(f'[验证码] 九宫格，需选 {need} 个 | 原始题目: {st.get("tips")!r}')
 
-    # 1) 参考图标：优先从 <img src> 下载 200x200 原图（最清晰），
-    #    再试 background-image，最后才退化到元素截图（72x24，很小）。
-    ref = fetch_image(st.get('quesSrc')) or fetch_image(st.get('quesBg'))
-    if not ref:
-        ref = shot_el(page, '.geetest_ques_tips')
-    if not ref:
-        print('[验证码] 未取到参考图，放弃本轮')
-        return False
-    ref = upscale_png(ref, 4, 600)
-
-    try:
+    # 1) 参考图标：等加载 + 优先下载原图
+    ref, ref_name = None, ''
+    for attempt in range(3):
+        raw_ref = load_ref_image(st, page)
+        if not raw_ref:
+            print('[验证码] 未取到参考图，放弃本轮')
+            return False
+        ref = upscale_png(raw_ref, 4, 640)
         ref_name = clean_name(vlm_chat(
-            '这是验证码的参考图标。只回答图中物体的中文名称，2-6个字，'
-            '不要解释、不要标点。看不出就回答：未知。', [ref]))
-    except Exception as e:
-        print(f'[验证码] 参考图识别失败: {e}')
-        return False
+            '这是验证码的参考图标。用 2-6 个汉字描述它：颜色 + 物体，'
+            '例如「红色苹果」「蓝色雨伞」；抽象图形就描述颜色和形状，例如「黑色圆形」。'
+            '只回答这几个字，不要解释、不要标点，不要回答「未知」。', [ref]))
+        # 纯字母/数字说明还是占位符状态，等一下再读
+        if ref_name and ref_name not in EMPTY_WORDS and re.search(r'[\u4e00-\u9fff]', ref_name):
+            break
+        print(f'[验证码] 参考图疑似未加载完成: {ref_name!r}，等待 ({attempt + 1}/3)')
+        page.wait_for_timeout(1200)
+        st = captcha_state(page)
+        if not st.get('quesImgOk'):
+            # 图压根没加载出来，点刷新换一张
+            refresh_captcha(page)
+            st = captcha_state(page)
+
     if not ref_name or ref_name in EMPTY_WORDS:
-        print(f'[验证码] 参考图无法识别: {ref_name!r}')
-        return False
+        print(f'[验证码] 参考图无法识别: {ref_name!r}，刷新换题')
+        return None if refresh_captcha(page) else False
     print(f'[验证码] 参考物体: {ref_name}')
 
     # 2) 逐格截图（每格单独截，避免整图切分错位）
@@ -492,9 +717,10 @@ def solve_nine(page, st):
     names = describe_cells(cells)
     print(f'[验证码] 格子内容: {names}')
 
-    # 4) 名称匹配（≥0.5 视为可信）
+    # 4) 名称匹配。阈值取 0.75：描述式命名（「红色苹果」vs「青色苹果」）相似度有 0.6，
+    #    阈值太低会把不同颜色的同类物体也选进来，宁可留给下一步的逐格比对
     scored = score_cells(ref_name, names)
-    idx = [i for s, i, _ in scored if s >= 0.5][:need]
+    idx = [i for s, i, _ in scored if s >= 0.75][:need]
     print(f'[验证码] 名称命中: {[i + 1 for i in idx]}')
 
     # 5) 不够就逐格直接比对补足（抗"闹钟/时钟"这类同义词错配）
@@ -546,67 +772,90 @@ def solve_nine(page, st):
     return True
 
 
+# ---------------------------------------------------------------- 文字点选
+
 def recognize_ref_chars(st, page):
     """从参考图识别要依次点击的汉字。
     ikuuu 的 tips 只是『请在下图依次点击』，不含具体字；
-    真正的字在 geetest_ques_tips 的 <img>（200x200 原图）里，如『炒肝片』。"""
-    ref = fetch_image(st.get('quesSrc')) or fetch_image(st.get('quesBg'))
-    if not ref:
-        ref = shot_el(page, '.geetest_ques_tips')
-    if not ref:
-        print('[验证码] 参考图（待点字）获取失败')
-        return []
-    ref = upscale_png(ref, 3, 600)
-    try:
+    真正的字在 geetest_ques_tips 的 <img> 里，如『炒肝片』。
+    注意：ddddocr 的检测器是场景文字模型，对白底提示图无效，这里只能靠视觉模型。"""
+    for attempt in range(3):
+        ref = load_ref_image(st, page)
+        if not ref:
+            print('[验证码] 参考图（待点字）获取失败')
+            return []
+        ref_up = upscale_png(ref, 4, 640)
         raw = vlm_chat(
-            '这是极验文字点选验证码的「提示图」，图里写着几个汉字，'
-            '要求按顺序在下方大图里依次点击这些字。\n'
-            '请从左到右准确读出图中所有汉字（按阅读顺序），只输出这些汉字本身。\n'
-            '不要解释、不要标点、不要引号。例如图里是「炒肝片」就只回答：炒肝片',
-            [ref])
-    except Exception as e:
-        print(f'[验证码] 参考图文字识别失败: {e}')
-        return []
-    # 只保留汉字，去掉模型可能的标点/说明
-    chars = re.findall(r'[\u4e00-\u9fff]', raw or '')
-    # 过滤常见的说明性词（若模型没听话）
-    chars = [c for c in chars if c not in '图中是这的是字依次点击请按顺序汉字如下']
-    print(f'[验证码] 参考图识别待点字: {chars} (原始: {raw!r})')
-    return chars[:6]
+            '这是极验文字点选验证码的「提示图」，图里写着 2~4 个汉字，'
+            '要求按从左到右的顺序在下方大图里依次点击这些字。\n'
+            '只输出图中这些汉字本身，不要解释、不要标点、不要引号。'
+            '例如图里是「炒肝片」就只回答：炒肝片',
+            [ref_up])
+        chars = re.findall(r'[\u4e00-\u9fff]', raw or '')
+        chars = [c for c in chars if c not in '图中是这的是字依次点击请按顺序汉字如下']
+        # 去重保序（模型复读时会产生上百个重复字）
+        seen, uniq = set(), []
+        for c in chars:
+            if c not in seen:
+                seen.add(c)
+                uniq.append(c)
+        if uniq:
+            print(f'[验证码] 参考图识别待点字: {uniq} (原始: {raw[:40]!r})')
+            return uniq[:6]
+        # 全是字母/空 -> 还是占位符，等图加载
+        print(f'[验证码] 参考图疑似占位符: {(raw or "")[:30]!r}，等待加载 ({attempt + 1}/3)')
+        page.wait_for_timeout(1200)
+        st = captcha_state(page)
+    return []
 
 
 def solve_click(page, st):
-    """文字点选：从参考图读出要点的字，逐个在验证码大图里定位并点击"""
+    """文字点选：参考图读字 -> OCR 定位图内所有字 -> 按字匹配 -> 点框中心。
+    返回值：True 已提交 / False 硬失败 / None 已刷新换题（不算失败）"""
     box = st.get('winRect') or st.get('clickRect') or st.get('bgRect')
     if not box or box.get('w', 0) < 40:
         print('[验证码] 未取到点选区域')
         return False
 
+    # 1) 要点的字来自参考图（不是 tips 文字）
+    chars = recognize_ref_chars(st, page)
+    if not chars:
+        print('[验证码] 参考图始终无法识别，刷新换题')
+        return None if refresh_captcha(page) else False
+
+    # 2) 大图截图
     img = shot_el(page, '.geetest_window') or shot_el(page, '.geetest_bg')
     if not img:
         print('[验证码] 点选区域截图失败')
         return False
-    img = upscale_png(img, 3, 1200)
 
-    # 关键修复：要点的字来自参考图，不是 tips 文字
-    chars = recognize_ref_chars(st, page)
-    if not chars:
-        # 兜底：仅当 tips 里真的带引号字时才用它（某些变体）
-        chars = parse_click_chars(st.get('tips'))
-        print(f'[验证码] 参考图无字，改用 tips: {chars}')
-    if not chars:
-        return False
+    # 3) 检测 + 逐字识别，拿到「图上有什么字、在哪」
+    items = detect_chars(img, box['w'], box['h'], scale=2)
+    if not items:
+        print('[验证码] 图内未检测到文字，刷新换题')
+        return None if refresh_captcha(page) else False
 
+    names = resolve_char_names(items, chars)
+
+    # 4) 按题目顺序匹配框（一个字只用一次）
+    used, plan = set(), []
     for ch in chars:
-        nx, ny = locate_char(img, ch)
-        if nx is None:
-            print(f'[验证码] 未定位到「{ch}」，放弃本轮')
-            return False
-        x = box['x'] + nx * box['w']
-        y = box['y'] + ny * box['h']
-        page.mouse.click(x, y)
-        print(f'  点击「{ch}」@ ({x:.0f},{y:.0f})')
-        time.sleep(random.uniform(0.3, 0.6))
+        hit = None
+        for i, n in enumerate(names):
+            if i not in used and n == ch:
+                hit = i
+                break
+        if hit is None:
+            print(f'[验证码] 图内没有「{ch}」，判定参考图识别有误，刷新换题')
+            return None if refresh_captcha(page) else False
+        used.add(hit)
+        plan.append((ch, items[hit]['cx'], items[hit]['cy']))
+
+    # 5) 点击（坐标全部来自 OCR，模型不参与定位）
+    for ch, cx, cy in plan:
+        page.mouse.click(box['x'] + cx, box['y'] + cy)
+        print(f'  点击「{ch}」@ ({box["x"] + cx:.0f},{box["y"] + cy:.0f})')
+        time.sleep(random.uniform(0.35, 0.7))
 
     page.wait_for_timeout(300)
     if not click_first(page, ['.geetest_commit', '.geetest_btn_commit',
@@ -652,11 +901,13 @@ def vlm_solve(page, domain):
         print('[验证码] 未识别的验证码类型')
         ok = False
 
+    if ok is None:
+        return None          # 已刷新换题，本轮不计失败
     if not ok:
         return False
 
     # 等极验回调结果
-    for _ in range(10):
+    for _ in range(12):
         if captcha_ready(page):
             print('[验证码] 通过')
             return True
@@ -702,17 +953,28 @@ def try_domain(domain):
             page.wait_for_timeout(500)
 
         # 点选题：用视觉模型多轮尝试
+        # fails 计「答错」，rounds 是总轮数上限；主动刷新换题不占失败次数
         if not ok:
-            for attempt in range(1, MAX_CAPTCHA_RETRY + 1):
-                print(f'[验证码] 视觉识别 {attempt}/{MAX_CAPTCHA_RETRY} ...')
-                if vlm_solve(page, domain):
+            fails, rounds = 0, 0
+            while fails < MAX_CAPTCHA_RETRY and rounds < MAX_CAPTCHA_RETRY + MAX_REFRESH:
+                rounds += 1
+                print(f'[验证码] 视觉识别 第 {rounds} 轮（已答错 {fails} 次）...')
+                res = vlm_solve(page, domain)
+                if res is True:
                     ok = True
                     break
+                if res is None:
+                    # 刷新换题后等新题出现
+                    page.wait_for_timeout(900)
+                    if not detect_kind(captcha_state(page)):
+                        click_first(page, ['.geetest_btn_click', '[class*="geetest_btn"]'])
+                        page.wait_for_timeout(1200)
+                    continue
+                fails += 1
                 # 极验答错后会自动换新题，这里只等新题出现并重新判型；
                 # 只有整个面板都消失了才需要重新点验证按钮。
                 page.wait_for_timeout(1500)
-                st = captcha_state(page)
-                if not detect_kind(st):
+                if not detect_kind(captcha_state(page)):
                     print('[验证码] 面板已关闭，重新点验证按钮')
                     click_first(page, ['.geetest_btn_click', '[class*="geetest_btn"]'])
                     page.wait_for_timeout(1200)
@@ -775,9 +1037,10 @@ def main():
     print(f'账号: {EMAIL}')
     print(f'候选域名: {", ".join(DOMAINS)}')
     print(f'视觉模型: {"glm-4v-flash" if ZHIPU_API_KEY else "未配置（仅支持无感验证）"}')
+    print(f'文字检测: {"ddddocr" if ddddocr else "未安装（点选题成功率低）"}')
 
     for domain in DOMAINS:
-        for attempt in range(1, 3):
+        for attempt in range(1, DOMAIN_RETRY + 1):
             try:
                 ok, msg = try_domain(domain)
             except Exception as e:
@@ -787,7 +1050,7 @@ def main():
                 push('✅ ikuuu 签到成功', f'域名: {domain}\n{msg}\n邮箱: {EMAIL}')
                 return True
             print(f'[{domain}] 第 {attempt} 次失败: {msg}')
-            if attempt < 2:
+            if attempt < DOMAIN_RETRY:
                 time.sleep(3)
 
     print('[ERROR] 所有域名均签到失败')
